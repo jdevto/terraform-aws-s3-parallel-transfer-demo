@@ -1,0 +1,93 @@
+#!/bin/bash
+
+set -euo pipefail
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "Starting user data script execution..."
+
+# Ensure required packages are installed (including SSM agent)
+yum update -y
+if ! command -v amazon-ssm-agent &> /dev/null; then
+  yum install -y amazon-ssm-agent
+fi
+yum install -y python3 python3-pip awscli
+
+systemctl enable amazon-ssm-agent
+systemctl restart amazon-ssm-agent
+sleep 5
+if systemctl is-active --quiet amazon-ssm-agent; then
+  echo "[$(date +%Y-%m-%d\ %H:%M:%S)] SSM agent is running"
+else
+  echo "[$(date +%Y-%m-%d\ %H:%M:%S)] ERROR: SSM agent failed to start"
+  systemctl status amazon-ssm-agent || true
+fi
+
+# Prepare scripts directory
+mkdir -p /opt/s3-demo/scripts
+cd /opt/s3-demo/scripts
+echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Downloading scripts from S3..."
+aws s3 cp s3://${bucket_name}/scripts/ /opt/s3-demo/scripts/ --recursive --region ${region}
+
+if [ -f requirements.txt ]; then
+  pip3 install -r requirements.txt || {
+    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] WARNING: pip install failed, trying with --break-system-packages"
+    pip3 install --break-system-packages -r requirements.txt || true
+  }
+fi
+chmod +x /opt/s3-demo/scripts/*.py || true
+
+# Ensure log file exists
+touch /var/log/s3-download.log
+chmod 644 /var/log/s3-download.log
+
+# Determine worker ID using IMDSv2
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $${TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
+WORKER_ID=$(aws ec2 describe-tags --region ${region} \
+  --filters "Name=resource-id,Values=$${INSTANCE_ID}" "Name=key,Values=WorkerID" \
+  --query 'Tags[0].Value' --output text 2>/dev/null)
+
+# Validate and default to 0 if empty or None
+if [ -z "$${WORKER_ID}" ] || [ "$${WORKER_ID}" = "None" ] || [ "$${WORKER_ID}" = "null" ]; then
+  WORKER_ID="0"
+fi
+
+# Ensure it's a valid integer
+if ! [[ "$${WORKER_ID}" =~ ^[0-9]+$ ]]; then
+  WORKER_ID="0"
+fi
+
+echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Worker ID: $${WORKER_ID}"
+
+# Create systemd service
+cat <<SERVICE > /etc/systemd/system/s3-worker.service
+[Unit]
+Description=S3 worker download job
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/s3-demo/scripts/worker_download.py --bucket ${bucket_name} --object-key ${target_object_key} --worker-id $${WORKER_ID} --total-workers ${worker_count} --chunk-size-mb ${chunk_size_mb}
+SERVICE
+
+# Create systemd timer
+cat <<TIMER > /etc/systemd/system/s3-worker.timer
+[Unit]
+Description=Run S3 worker every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=1s
+Unit=s3-worker.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable s3-worker.timer
+systemctl start s3-worker.timer
+
+echo "[$(date +%Y-%m-%d\ %H:%M:%S)] User data script execution completed successfully"
